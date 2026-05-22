@@ -9,10 +9,11 @@ import ServiceManagement
 ///   - Frame rate halves on Low Power Mode.
 ///   - No-op redraws are skipped (the renderer tells us when nothing changed).
 final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
-    // Render rates: tweak here to trade smoothness for power. 20 fps in the
-    // menu bar is plenty — the strip is so small that 30+ fps is wasted work.
-    private let activeFPS: Double = 20
-    private let lowPowerFPS: Double = 10
+    // Render rates: tweak here to trade smoothness for power. 15 fps in a
+    // ~100×22 pt menu bar item is plenty — the eye can't resolve more on
+    // something this small, and dropping from 30 cuts render work in half.
+    private let activeFPS: Double = 15
+    private let lowPowerFPS: Double = 8
     /// Frames of consecutive silence before we suspend the render timer.
     /// At 30fps, 24 frames ≈ 800ms — long enough to let bars decay visually.
     private let silenceFramesToIdle: Int = 24
@@ -113,7 +114,24 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         statusItem.button?.image = image
     }
 
+    private func visiblyChanged(newBands: [Float], newLevel: Float) -> Bool {
+        if abs(newLevel - lastDrawnLevel) > visualEpsilon { return true }
+        guard lastDrawnBands.count == newBands.count else { return true }
+        for i in 0..<newBands.count {
+            if abs(newBands[i] - lastDrawnBands[i]) > visualEpsilon { return true }
+        }
+        return false
+    }
+
     private var loggedFirstAudio = false
+
+    // Track what we last drew so we can skip redraws when the difference is too
+    // small to see — saves CGImage creation + AppKit invalidation each frame.
+    private var lastDrawnBands: [Float] = []
+    private var lastDrawnLevel: Float = -1
+    /// Minimum band-value delta that's worth a redraw. 0.012 ≈ ~0.25 px on the
+    /// tallest bar — anything smaller than that is invisible anyway.
+    private let visualEpsilon: Float = 0.012
 
     // Waveform shaping. The raw signal has too much high-frequency content
     // packed into too few pixels — it just looks like noise. Three fixes:
@@ -206,8 +224,12 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         let bandsActive = bands.contains(where: { $0 > silenceLevelThreshold })
         let changed = renderer.update(bands: bands, waveform: wave, level: level)
 
-        if changed {
+        // Only push a new image into the menu bar when something visibly changed
+        // — sub-pixel deltas are wasted work + cause AppKit invalidation churn.
+        if changed && visiblyChanged(newBands: bands, newLevel: level) {
             renderAndAssign()
+            lastDrawnBands = bands
+            lastDrawnLevel = level
         }
 
         if !bandsActive && level < silenceLevelThreshold {

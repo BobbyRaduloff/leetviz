@@ -18,11 +18,13 @@ final class FFTProcessor {
     private let sampleRate: Float
 
     /// Smoothing applied on attack (new > previous). 0 = instant, 1 = frozen.
-    /// Higher = less jitter, more lag. 0.55 feels glued without going sluggish.
-    var attackSmoothing: Float = 0.55
+    /// Higher = less jitter, more lag. Lower = more transient detail (drum hits
+    /// punch through, vocals dance). 0.30 keeps it responsive without strobing.
+    var attackSmoothing: Float = 0.30
     /// Multiplied into the previous value each frame when input drops.
-    /// Closer to 1 = slower decay. 0.90 gives a satisfying "fall" without dragging.
-    var decay: Float = 0.90
+    /// Closer to 1 = slower decay. 0.80 lets bars fall fast enough that
+    /// successive snare hits actually look distinct.
+    var decay: Float = 0.80
 
     private var fftSetup: FFTSetup
     private var window: [Float]
@@ -141,7 +143,7 @@ final class FFTProcessor {
         // mid-range so loud bars look meaningfully taller than quiet ones.
         // Lower `normDivisor` = more sensitive; lower `softClipK` = more "drama".
         let normDivisor: Float = 3.2
-        let softClipK: Float = 2.6
+        let softClipK: Float = 1.8
         for i in 0..<bandCount {
             let x = max(0, newBands[i] / normDivisor)
             newBands[i] = 1 - expf(-x * softClipK)

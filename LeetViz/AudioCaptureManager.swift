@@ -33,7 +33,10 @@ final class AudioCaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
 
     private let ringLock = NSLock()
     private var ring: [Float] = []
-    private let ringCapacity = 4096
+    // 2048 samples ≈ 43 ms at 48 kHz. Enough for our 1024-sample FFT window
+    // and waveform mode with a bit of headroom; halves the per-tick copy cost
+    // compared to the original 4096.
+    private let ringCapacity = 2048
 
     private(set) var isRunning = false
     private var wasAudible = false
