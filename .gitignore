@@ -16,6 +16,13 @@ DerivedData/
 *.dSYM.zip
 *.dSYM
 
+# Exported app bundles & archives — releases live on GitHub, not here.
+*.app/
+*.zip
+*.dmg
+*.pkg
+*.xcarchive
+
 # Swift Package Manager (not used here, but future-proof)
 .swiftpm/
 Package.resolved
