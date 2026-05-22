@@ -1,8 +1,10 @@
 # LeetViz -- a status bar audio visualizer for macOS
 
-A tiny macOS menu bar app that visualizes whatever music is playing on your Mac. Captures system audio (not the mic) via ScreenCaptureKit, runs a real FFT, and draws bars / waveform / pulsing blocks straight inside the status item.
+A tiny macOS menu bar app that visualizes whatever music is playing on your Mac. Captures system audio (not the mic) via the Core Audio Process Tap API, runs a real FFT, and draws bars / waveform / pulsing blocks straight inside the status item.
 
-Designed to be unnoticeably light: the render loop suspends itself when the system is silent, drops to 15 fps on Low Power Mode, and never animates faster than 30 fps.
+Designed to be unnoticeably light: the render loop suspends itself when the system is silent, drops to 8 fps on Low Power Mode, and never animates faster than 15 fps.
+
+**No screen-recording indicator.** v1.2+ uses Core Audio Process Tap instead of ScreenCaptureKit, so the system-wide "you're being recorded" dot doesn't appear in your menu bar.
 
 ## Build & run
 
@@ -10,13 +12,13 @@ Designed to be unnoticeably light: the render loop suspends itself when the syst
 2. Set the signing team on the **LeetViz** target if Xcode asks (Signing & Capabilities → Team). Personal Team is fine.
 3. ⌘R to build and run. The Dock icon will not appear; look for the visualizer in your menu bar.
 
-Requires macOS 13 or later.
+Requires macOS 14.2 or later (Core Audio Process Tap was introduced in 14.2).
 
-## Grant Screen Recording permission
+## Grant audio capture permission
 
-System audio capture goes through the OS's Screen Recording permission. The first time you launch, macOS will prompt you. If you decline, you'll see a `⚠ Grant Screen Recording permission…` item at the top of the right-click menu — pick it (or the "Open Screen Recording Settings…" item below) to jump straight to the right pane.
+The first time you launch, macOS will prompt you to allow LeetViz to capture audio output. If you decline, you'll see a `⚠ Grant audio capture permission…` item at the top of the right-click menu — pick it (or "Open Privacy Settings…") to jump to the right pane.
 
-After enabling LeetViz in **System Settings → Privacy & Security → Screen Recording**, **quit and relaunch the app** (TCC only re-reads the grant on next launch).
+After enabling LeetViz under **System Settings → Privacy & Security → Microphone** (the system audio capture permission lives in the audio-related TCC group), **quit and relaunch the app** — TCC only re-reads the grant on next launch.
 
 ## Using it
 
@@ -38,9 +40,9 @@ LeetViz/
 ├── AppDelegate.swift          – entry point, sets accessory activation policy
 ├── MenuBarController.swift    – status item, menu, render loop, idle/wake state machine
 ├── VisualizerView.swift       – the three drawing modes
-├── AudioCaptureManager.swift  – SCStream setup, ring buffer, peak detection
+├── AudioCaptureManager.swift  – Core Audio Process Tap setup, ring buffer, peak detection
 ├── FFTProcessor.swift         – vDSP forward FFT + log-spaced band binning
 ├── SettingsStore.swift        – UserDefaults wrapper for style & accent
-├── Info.plist                 – LSUIElement = YES, macOS 13 minimum
-└── LeetViz.entitlements       – sandbox off (ScreenCaptureKit + non-store distribution)
+├── Info.plist                 – LSUIElement = YES, macOS 14.2 minimum
+└── LeetViz.entitlements       – sandbox off (non-store distribution)
 ```

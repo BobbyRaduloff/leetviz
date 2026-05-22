@@ -283,7 +283,7 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         loginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(loginItem)
 
-        let recItem = NSMenuItem(title: "Open Screen Recording Settings…",
+        let recItem = NSMenuItem(title: "Open Privacy Settings…",
                                  action: #selector(openRecordingSettings),
                                  keyEquivalent: "")
         recItem.target = self
@@ -348,7 +348,11 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
     }
 
     @objc private func openRecordingSettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+        // CATap permission lives under TCC audio capture; on macOS 14+ that
+        // shows up in the Microphone pane. If the pane URL changes in a future
+        // macOS, this will gracefully fall back to opening the main Privacy
+        // pane via the no-op result of an unknown pane id.
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
         NSWorkspace.shared.open(url)
     }
 
@@ -358,7 +362,7 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         NSLog("LeetViz: audio permission missing — adding banner to menu")
         guard !permissionItemInMenu else { return }
         permissionItemInMenu = true
-        let title = "⚠ Grant Screen Recording permission…"
+        let title = "⚠ Grant audio capture permission…"
         let item = NSMenuItem(title: title,
                               action: #selector(openRecordingSettings),
                               keyEquivalent: "")

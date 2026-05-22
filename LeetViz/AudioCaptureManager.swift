@@ -1,41 +1,46 @@
 import Accelerate
 import AudioToolbox
-import CoreMedia
+import AVFoundation
+import CoreAudio
 import Foundation
-import ScreenCaptureKit
 
 protocol AudioCaptureManagerDelegate: AnyObject {
     func audioCaptureManagerNeedsPermission(_ manager: AudioCaptureManager)
     func audioCaptureManager(_ manager: AudioCaptureManager, didFailWith error: Error)
-    /// Called on the main thread when the capture transitions from silent to
-    /// audible. The render loop uses this to wake itself from idle.
+    /// Called on the main thread when capture transitions silent → audible.
     func audioCaptureManagerDidWake(_ manager: AudioCaptureManager)
 }
 
-/// Captures system audio via ScreenCaptureKit and keeps a rolling ring buffer
-/// of float mono samples that the render loop can snapshot at any time.
+/// Captures system audio using Core Audio Process Tap (macOS 14.2+).
 ///
-/// Permission flow: SCShareableContent triggers the macOS Screen Recording prompt
-/// on first launch. If the user declines, subsequent calls fail and we notify
-/// the delegate so the UI can surface a "Open Settings" affordance.
-final class AudioCaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
+/// Unlike the previous ScreenCaptureKit-based implementation, this does NOT
+/// trigger the macOS screen-recording indicator. The user grants a separate
+/// "Audio recording" permission instead.
+///
+/// Architecture:
+///   1. Create a `CATapDescription` that taps every process' audio output
+///      (stereo, mixed down).
+///   2. Wrap that tap inside a private aggregate device.
+///   3. Register an `AudioDeviceIOProc` callback on the aggregate device.
+///   4. In the callback, downmix to mono float, push to a ring buffer, and
+///      detect silent/audible transitions so the render loop can sleep.
+final class AudioCaptureManager: NSObject {
     weak var delegate: AudioCaptureManagerDelegate?
 
     let sampleRate: Float = 48_000
 
-    /// Threshold below which we consider the system silent. Anything below this
-    /// peak doesn't wake the render loop. Calibrated against typical music; bump
-    /// it up if quiet ambient noise causes false wakes.
+    /// Peak threshold below which we consider the system silent. Cheap RMS-free
+    /// detector; tune up if quiet ambient noise causes false wakes.
     var wakeThreshold: Float = 0.005
 
-    private var stream: SCStream?
-    private let sampleQueue = DispatchQueue(label: "leetviz.audio.samples")
+    private var tapID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var ioProcID: AudioDeviceIOProcID?
 
     private let ringLock = NSLock()
     private var ring: [Float] = []
-    // 2048 samples ≈ 43 ms at 48 kHz. Enough for our 1024-sample FFT window
-    // and waveform mode with a bit of headroom; halves the per-tick copy cost
-    // compared to the original 4096.
+    /// 2048 samples ≈ 43 ms at 48 kHz — enough for the 1024-sample FFT window
+    /// and waveform mode with headroom.
     private let ringCapacity = 2048
 
     private(set) var isRunning = false
@@ -44,14 +49,20 @@ final class AudioCaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        Task { await self.startAsync() }
+        // No microphone request here — that would show a misleading "wants to
+        // use the microphone" prompt. The Core Audio Tap permission
+        // (`kTCCServiceAudioCapture`, distinct from Microphone) is supposed to
+        // be prompted by macOS the first time audio actually flows through the
+        // tap. The displayed text is taken from NSAudioCaptureUsageDescription
+        // in Info.plist.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.setupTap()
+        }
     }
 
     func stop() {
         isRunning = false
-        let s = stream
-        stream = nil
-        Task { try? await s?.stopCapture() }
+        teardown()
     }
 
     /// Snapshot the most recent samples. Safe to call from any thread.
@@ -61,88 +72,373 @@ final class AudioCaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
         return ring
     }
 
-    private func startAsync() async {
-        NSLog("LeetViz: requesting SCShareableContent…")
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            NSLog("LeetViz: got SCShareableContent (%d displays)", content.displays.count)
-            guard let display = content.displays.first else {
-                await report(error: NSError(domain: "LeetViz", code: 1,
-                                            userInfo: [NSLocalizedDescriptionKey: "No display available"]))
-                return
-            }
-            let filter = SCContentFilter(display: display, excludingWindows: [])
-            let config = SCStreamConfiguration()
-            config.capturesAudio = true
-            config.excludesCurrentProcessAudio = true
-            config.sampleRate = Int(sampleRate)
-            config.channelCount = 2
-            // Video has to exist on the stream but we never read it; keep it tiny.
-            config.width = 2
-            config.height = 2
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+    // MARK: - Setup
 
-            let stream = SCStream(filter: filter, configuration: config, delegate: self)
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
-            // SCStream always produces video frames — there's no audio-only mode.
-            // Without an output handler for them, SCK logs "Dropping frame" per
-            // frame. Register a screen handler that just discards (the callback
-            // early-returns on `.screen`). Frames are 2×2 at 1fps so cost is nil.
-            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
-            try await stream.startCapture()
-            self.stream = stream
-            NSLog("LeetViz: SCStream startCapture succeeded — audio flowing")
-        } catch {
-            NSLog("LeetViz: SCStream start failed: %@ (%@ code=%d)",
-                  error.localizedDescription,
-                  (error as NSError).domain,
-                  (error as NSError).code)
-            await report(error: error)
+    private func setupTap() {
+        NSLog("LeetViz: enumerating audio processes…")
+        let processes = enumerateAudioProcesses()
+        NSLog("LeetViz: found %d audio process objects to tap", processes.count)
+        guard !processes.isEmpty else {
+            NSLog("LeetViz: no audio process objects available — bailing")
+            delegate?.audioCaptureManager(self, didFailWith: simpleError("No audio processes available"))
+            return
         }
-    }
 
-    @MainActor
-    private func report(error: Error) {
-        let ns = error as NSError
-        // ScreenCaptureKit returns various error codes when TCC denies us;
-        // detect them so we can surface a permission affordance instead of
-        // just logging a cryptic failure.
-        let msg = ns.localizedDescription.lowercased()
-        let isPermissionIssue =
-            ns.code == -3801 ||
-            ns.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" ||
-            msg.contains("permission") ||
-            msg.contains("declined") ||
-            msg.contains("not authorized")
-        if isPermissionIssue {
-            delegate?.audioCaptureManagerNeedsPermission(self)
+        NSLog("LeetViz: creating Core Audio process tap…")
+        // Explicit list of processes to mix down. The "global tap excluding
+        // none" initializer didn't deliver samples in practice — enumerating
+        // and mixing is the pattern that actually works.
+        let tapDescription = CATapDescription(stereoMixdownOfProcesses: processes)
+        tapDescription.muteBehavior = .unmuted
+        tapDescription.isPrivate = true
+        tapDescription.isExclusive = false
+
+        var newTapID = AudioObjectID(kAudioObjectUnknown)
+        let createStatus = AudioHardwareCreateProcessTap(tapDescription, &newTapID)
+        guard createStatus == noErr else {
+            NSLog("LeetViz: AudioHardwareCreateProcessTap failed: %d", createStatus)
+            reportError(status: createStatus, stage: "create-tap")
+            return
+        }
+        tapID = newTapID
+        NSLog("LeetViz: tap created (id=%u)", tapID)
+
+        guard let tapUID = readTapUID(tapID: tapID) else {
+            NSLog("LeetViz: couldn't read tap UID — bailing")
+            teardown()
+            delegate?.audioCaptureManager(self, didFailWith: simpleError("Could not read tap UID"))
+            return
+        }
+
+        // The aggregate device needs a real audio device to act as the clock
+        // source — without one, the tap is wired in but no samples are
+        // delivered (you see Create + Start succeed but the IOProc never
+        // fires). The default system output device is the right pick: it's
+        // where the audio the user is hearing is going, so the tap's mix
+        // naturally lines up with its clock.
+        guard let outputUID = hardwareOutputDeviceUID() else {
+            NSLog("LeetViz: couldn't find a hardware output device — bailing")
+            teardown()
+            delegate?.audioCaptureManager(self, didFailWith: simpleError("No hardware output device"))
+            return
+        }
+        NSLog("LeetViz: anchoring aggregate to hardware output UID=%@", outputUID)
+
+        let aggregateUID = "app.leetviz.aggregate.\(UUID().uuidString)"
+        let aggregateDescription: [String: Any] = [
+            kAudioAggregateDeviceUIDKey: aggregateUID,
+            kAudioAggregateDeviceNameKey: "LeetViz Audio Tap",
+            kAudioAggregateDeviceIsPrivateKey: 1,
+            kAudioAggregateDeviceIsStackedKey: 0,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceSubDeviceListKey: [
+                [kAudioSubDeviceUIDKey: outputUID] as [String: Any]
+            ],
+            kAudioAggregateDeviceTapListKey: [
+                [
+                    kAudioSubTapUIDKey: tapUID,
+                    kAudioSubTapDriftCompensationKey: 1,
+                ] as [String: Any]
+            ],
+            kAudioAggregateDeviceTapAutoStartKey: 1,
+        ]
+
+        var newAggregateID = AudioDeviceID(kAudioObjectUnknown)
+        let aggStatus = AudioHardwareCreateAggregateDevice(
+            aggregateDescription as CFDictionary,
+            &newAggregateID
+        )
+        guard aggStatus == noErr else {
+            NSLog("LeetViz: AudioHardwareCreateAggregateDevice failed: %d", aggStatus)
+            teardown()
+            reportError(status: aggStatus, stage: "create-aggregate")
+            return
+        }
+        aggregateDeviceID = newAggregateID
+        NSLog("LeetViz: aggregate device created (id=%u)", aggregateDeviceID)
+
+        // Register IOProc and start. The IOProc fires on Core Audio's real-time
+        // thread; we pass `self` through inClientData and reverse it inside.
+        let unmanagedSelf = Unmanaged.passUnretained(self).toOpaque()
+        var newProcID: AudioDeviceIOProcID?
+        let procStatus = AudioDeviceCreateIOProcID(
+            aggregateDeviceID,
+            audioIOProcCallback,
+            unmanagedSelf,
+            &newProcID
+        )
+        guard procStatus == noErr, let procID = newProcID else {
+            NSLog("LeetViz: AudioDeviceCreateIOProcID failed: %d", procStatus)
+            teardown()
+            reportError(status: procStatus, stage: "create-ioproc")
+            return
+        }
+        ioProcID = procID
+
+        // Inspect the input stream format so we know what the IOProc is
+        // going to deliver. If the format isn't Float32 we won't decode it
+        // correctly; log it loudly so future-us isn't confused.
+        var inputFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var formatAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: 0
+        )
+        let formatStatus = AudioObjectGetPropertyData(
+            aggregateDeviceID, &formatAddress, 0, nil, &formatSize, &inputFormat
+        )
+        if formatStatus == noErr {
+            let isFloat = (inputFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+            let isNonInterleaved = (inputFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+            NSLog("LeetViz: aggregate input format — sampleRate=%.0f channels=%u float=%@ nonInterleaved=%@ bytesPerFrame=%u",
+                  inputFormat.mSampleRate,
+                  inputFormat.mChannelsPerFrame,
+                  isFloat ? "yes" : "NO",
+                  isNonInterleaved ? "yes" : "no",
+                  inputFormat.mBytesPerFrame)
         } else {
-            delegate?.audioCaptureManager(self, didFailWith: error)
+            NSLog("LeetViz: couldn't read aggregate input stream format (status=%d)", formatStatus)
+        }
+
+        let startStatus = AudioDeviceStart(aggregateDeviceID, procID)
+        guard startStatus == noErr else {
+            NSLog("LeetViz: AudioDeviceStart failed: %d", startStatus)
+            teardown()
+            reportError(status: startStatus, stage: "start-device")
+            return
+        }
+
+        NSLog("LeetViz: Core Audio tap streaming — audio flowing")
+    }
+
+    private func teardown() {
+        if let procID = ioProcID {
+            AudioDeviceStop(aggregateDeviceID, procID)
+            AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            ioProcID = nil
+        }
+        if aggregateDeviceID != AudioObjectID(kAudioObjectUnknown) {
+            AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != AudioObjectID(kAudioObjectUnknown) {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
         }
     }
 
-    // MARK: - SCStreamOutput
+    /// Enumerate every process that has registered audio activity with
+    /// CoreAudio's HAL. These are the `AudioObjectID`s the tap accepts.
+    private func enumerateAudioProcesses() -> [AudioObjectID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        let s1 = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size
+        )
+        guard s1 == noErr, size > 0 else {
+            NSLog("LeetViz: process list size query failed (status=%d size=%u)", s1, size)
+            return []
+        }
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var processes = [AudioObjectID](repeating: 0, count: count)
+        let s2 = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &processes
+        )
+        guard s2 == noErr else {
+            NSLog("LeetViz: process list query failed (status=%d)", s2)
+            return []
+        }
+        return processes
+    }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid, let pcm = sampleBuffer.toMonoFloat() else { return }
+    /// Find a real hardware output device UID (not an aggregate). We need a
+    /// hardware-backed clock for our aggregate-with-tap setup; nesting our
+    /// aggregate inside another aggregate (eqMac, BlackHole, Loopback, etc.)
+    /// silently breaks sample delivery.
+    private func hardwareOutputDeviceUID() -> String? {
+        // 1. Enumerate all audio devices.
+        var listAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &listAddr, 0, nil, &size
+        )
+        guard status == noErr, size > 0 else { return nil }
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = [AudioObjectID](repeating: 0, count: count)
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &listAddr, 0, nil, &size, &deviceIDs
+        )
+        guard status == noErr else { return nil }
 
-        // Cheap peak via vDSP — single pass, no allocations beyond the array
-        // we already produced. Used to decide whether to wake the render loop.
+        // 2. Pick the first device that (a) has output streams and (b) is not
+        // an aggregate. Built-in speakers / headphones / actual external DACs
+        // all qualify; eqMac, BlackHole, Loopback aggregates are skipped.
+        for id in deviceIDs {
+            if hasOutputStreams(id), !isAggregate(id), let uid = deviceUID(id) {
+                NSLog("LeetViz: picked hardware output UID=%@ id=%u", uid, id)
+                return uid
+            }
+        }
+        return nil
+    }
+
+    private func hasOutputStreams(_ deviceID: AudioObjectID) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        let status = AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size)
+        return status == noErr && size > 0
+    }
+
+    private func isAggregate(_ deviceID: AudioObjectID) -> Bool {
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &transport)
+        return status == noErr && transport == kAudioDeviceTransportTypeAggregate
+    }
+
+    private func deviceUID(_ deviceID: AudioObjectID) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &uid)
+        guard status == noErr, let cf = uid?.takeRetainedValue() else { return nil }
+        return cf as String
+    }
+
+    private func readTapUID(tapID: AudioObjectID) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(tapID, &addr, 0, nil, &size, &uid)
+        guard status == noErr, let cf = uid?.takeRetainedValue() else { return nil }
+        return cf as String
+    }
+
+    private func reportError(status: OSStatus, stage: String) {
+        // The tap-create call fails fast with permission-denied codes when TCC
+        // hasn't granted us audio capture. Heuristic: any error during create-tap
+        // is treated as "permission needed" so the UI shows the affordance.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if stage == "create-tap" {
+                self.delegate?.audioCaptureManagerNeedsPermission(self)
+            } else {
+                let err = self.simpleError("Audio tap \(stage) failed (status=\(status))")
+                self.delegate?.audioCaptureManager(self, didFailWith: err)
+            }
+        }
+    }
+
+    private func simpleError(_ message: String) -> NSError {
+        NSError(domain: "LeetViz", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    // MARK: - IOProc
+
+    private var loggedFirstCallback = false
+    private var loggedFirstAudible = false
+
+    fileprivate func handleAudio(bufferList: UnsafePointer<AudioBufferList>) {
+        let mutableList = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: bufferList)
+        )
+        guard mutableList.count > 0 else { return }
+
+        if !loggedFirstCallback {
+            loggedFirstCallback = true
+            let firstBuffer = mutableList[0]
+            NSLog("LeetViz: first IOProc callback — buffers=%d, ch=%u, bytes=%u",
+                  mutableList.count, firstBuffer.mNumberChannels, firstBuffer.mDataByteSize)
+        }
+
+        // Downmix to mono float. The tap delivers Float32; if the layout is
+        // interleaved we have one buffer with N channels, otherwise one buffer
+        // per channel. Handle both.
+        let mono: [Float]
+        if mutableList.count == 1 {
+            let buf = mutableList[0]
+            let channelCount = max(1, Int(buf.mNumberChannels))
+            let totalFloats = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            guard totalFloats > 0, let data = buf.mData else { return }
+            let ptr = data.bindMemory(to: Float.self, capacity: totalFloats)
+            if channelCount == 1 {
+                mono = Array(UnsafeBufferPointer(start: ptr, count: totalFloats))
+            } else {
+                let frames = totalFloats / channelCount
+                var out = [Float](repeating: 0, count: frames)
+                for i in 0..<frames {
+                    var sum: Float = 0
+                    for c in 0..<channelCount { sum += ptr[i * channelCount + c] }
+                    out[i] = sum / Float(channelCount)
+                }
+                mono = out
+            }
+        } else {
+            // Non-interleaved: each channel in its own buffer.
+            let first = mutableList[0]
+            let frames = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+            guard frames > 0 else { return }
+            var out = [Float](repeating: 0, count: frames)
+            var channels = 0
+            for buf in mutableList {
+                guard let data = buf.mData else { continue }
+                let p = data.bindMemory(to: Float.self, capacity: frames)
+                for i in 0..<frames { out[i] += p[i] }
+                channels += 1
+            }
+            if channels > 1 {
+                let inv = 1.0 / Float(channels)
+                for i in 0..<frames { out[i] *= inv }
+            }
+            mono = out
+        }
+
+        // Cheap peak for wake detection.
         var peak: Float = 0
-        pcm.withUnsafeBufferPointer { ptr in
-            if let base = ptr.baseAddress, ptr.count > 0 {
-                vDSP_maxmgv(base, 1, &peak, vDSP_Length(ptr.count))
+        mono.withUnsafeBufferPointer { bp in
+            if let base = bp.baseAddress, bp.count > 0 {
+                vDSP_maxmgv(base, 1, &peak, vDSP_Length(bp.count))
             }
         }
 
         ringLock.lock()
-        ring.append(contentsOf: pcm)
+        ring.append(contentsOf: mono)
         if ring.count > ringCapacity {
             ring.removeFirst(ring.count - ringCapacity)
         }
         ringLock.unlock()
 
         let audible = peak >= wakeThreshold
+        if audible && !loggedFirstAudible {
+            loggedFirstAudible = true
+            NSLog("LeetViz: first audible audio (peak=%.4f)", peak)
+        }
         if audible && !wasAudible {
             wasAudible = true
             DispatchQueue.main.async { [weak self] in
@@ -150,101 +446,47 @@ final class AudioCaptureManager: NSObject, SCStreamDelegate, SCStreamOutput {
                 self.delegate?.audioCaptureManagerDidWake(self)
             }
         } else if !audible && wasAudible {
-            // Hysteresis: only flip back to "silent" when peak stays well below
-            // the threshold for a moment, so we don't strobe between states on
-            // quiet passages. Render loop handles its own decay tail.
+            // Hysteresis: only flip back to silent when peak stays well below
+            // the threshold; render loop handles its own decay tail.
             if peak < wakeThreshold * 0.5 {
                 wasAudible = false
             }
         }
     }
-
-    // MARK: - SCStreamDelegate
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        Task { @MainActor in self.report(error: error) }
-    }
 }
 
-// MARK: - CMSampleBuffer → mono Float
-
-private extension CMSampleBuffer {
-    func toMonoFloat() -> [Float]? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(self),
-              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return nil }
-        let asbd = asbdPtr.pointee
-        guard (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 else { return nil }
-
-        let isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
-        let channelCount = Int(asbd.mChannelsPerFrame)
-
-        var sizeNeeded = 0
-        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            self,
-            bufferListSizeNeededOut: &sizeNeeded,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: nil
-        )
-        guard sizeNeeded > 0 else { return nil }
-        let listRaw = UnsafeMutableRawPointer.allocate(
-            byteCount: sizeNeeded,
-            alignment: MemoryLayout<AudioBufferList>.alignment
-        )
-        defer { listRaw.deallocate() }
-        let listPtr = listRaw.bindMemory(to: AudioBufferList.self, capacity: 1)
-
-        var blockBuffer: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            self,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: listPtr,
-            bufferListSize: sizeNeeded,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr else { return nil }
-        _ = blockBuffer
-
-        let buffers = UnsafeMutableAudioBufferListPointer(listPtr)
-
-        if isInterleaved {
-            guard let buf = buffers.first, let raw = buf.mData else { return nil }
-            let totalFloats = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
-            let ptr = raw.bindMemory(to: Float.self, capacity: totalFloats)
-            if channelCount <= 1 {
-                return Array(UnsafeBufferPointer(start: ptr, count: totalFloats))
-            }
-            let frames = totalFloats / channelCount
-            var mono = [Float](repeating: 0, count: frames)
-            for i in 0..<frames {
-                var sum: Float = 0
-                for c in 0..<channelCount { sum += ptr[i * channelCount + c] }
-                mono[i] = sum / Float(channelCount)
-            }
-            return mono
+/// C-style IOProc trampoline. Core Audio fires this on its real-time thread;
+/// we hop into the manager instance via the opaque clientData pointer.
+private var ioprocFireCount: Int = 0
+private let audioIOProcCallback: AudioDeviceIOProc = { (
+    _ inDevice: AudioObjectID,
+    _ inNow: UnsafePointer<AudioTimeStamp>,
+    _ inInputData: UnsafePointer<AudioBufferList>,
+    _ inInputTime: UnsafePointer<AudioTimeStamp>,
+    _ outOutputData: UnsafeMutablePointer<AudioBufferList>,
+    _ inOutputTime: UnsafePointer<AudioTimeStamp>,
+    _ inClientData: UnsafeMutableRawPointer?
+) -> OSStatus in
+    // Log the first few invocations regardless of buffer state, so we can tell
+    // "IOProc never fires" apart from "IOProc fires with empty buffers" apart
+    // from "IOProc fires but buffers have a format we don't decode".
+    ioprocFireCount += 1
+    if ioprocFireCount <= 3 {
+        let bl = inInputData.pointee
+        let firstBufferBytes: UInt32
+        let firstBufferChannels: UInt32
+        if bl.mNumberBuffers > 0 {
+            firstBufferBytes = bl.mBuffers.mDataByteSize
+            firstBufferChannels = bl.mBuffers.mNumberChannels
         } else {
-            // Non-interleaved: each channel is its own AudioBuffer.
-            guard let first = buffers.first else { return nil }
-            let frames = Int(first.mDataByteSize) / MemoryLayout<Float>.size
-            var mono = [Float](repeating: 0, count: frames)
-            var channels = 0
-            for b in buffers {
-                guard let data = b.mData else { continue }
-                let p = data.bindMemory(to: Float.self, capacity: frames)
-                for i in 0..<frames { mono[i] += p[i] }
-                channels += 1
-            }
-            if channels > 1 {
-                let inv = 1.0 / Float(channels)
-                for i in 0..<frames { mono[i] *= inv }
-            }
-            return mono
+            firstBufferBytes = 0
+            firstBufferChannels = 0
         }
+        NSLog("LeetViz: IOProc fire #%d — numBuffers=%u firstBytes=%u firstCh=%u",
+              ioprocFireCount, bl.mNumberBuffers, firstBufferBytes, firstBufferChannels)
     }
+    guard let clientData = inClientData else { return noErr }
+    let manager = Unmanaged<AudioCaptureManager>.fromOpaque(clientData).takeUnretainedValue()
+    manager.handleAudio(bufferList: inInputData)
+    return noErr
 }
