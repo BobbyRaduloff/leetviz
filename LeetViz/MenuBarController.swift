@@ -40,15 +40,11 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
     }
 
     func start() {
-        NSLog("LeetViz: start() — building status item")
         statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
         if let button = statusItem.button {
             button.title = ""
             button.imagePosition = .imageOnly
             (button.cell as? NSButtonCell)?.highlightsBy = []
-            NSLog("LeetViz: status button bounds=%@", NSStringFromRect(button.bounds))
-        } else {
-            NSLog("LeetViz: WARNING statusItem.button is nil")
         }
 
         renderer.style = SettingsStore.shared.style
@@ -63,7 +59,6 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
 
         audio.delegate = self
         audio.start()
-        NSLog("LeetViz: audio.start() invoked")
 
         startRenderTimer()
 
@@ -122,8 +117,6 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         }
         return false
     }
-
-    private var loggedFirstAudio = false
 
     // Track what we last drew so we can skip redraws when the difference is too
     // small to see — saves CGImage creation + AppKit invalidation each frame.
@@ -203,10 +196,6 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
         let level: Float
 
         if samples.count >= 1024 {
-            if !loggedFirstAudio {
-                loggedFirstAudio = true
-                NSLog("LeetViz: first audio batch received (%d samples in ring)", samples.count)
-            }
             bands = fft.process(samples: samples)
             let tail = samples.suffix(512)
             var sum: Float = 0
@@ -312,11 +301,9 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
             if service.status == .enabled {
                 try service.unregister()
                 sender.state = .off
-                NSLog("LeetViz: Open at Login disabled")
             } else {
                 try service.register()
                 sender.state = (service.status == .enabled) ? .on : .off
-                NSLog("LeetViz: Open at Login enabled (status=%d)", service.status.rawValue)
             }
         } catch {
             NSLog("LeetViz: Open at Login toggle failed: %@", error.localizedDescription)
@@ -359,7 +346,6 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
     // MARK: - AudioCaptureManagerDelegate
 
     func audioCaptureManagerNeedsPermission(_ manager: AudioCaptureManager) {
-        NSLog("LeetViz: audio permission missing — adding banner to menu")
         guard !permissionItemInMenu else { return }
         permissionItemInMenu = true
         let title = "⚠ Grant audio capture permission…"
@@ -376,7 +362,6 @@ final class MenuBarController: NSObject, AudioCaptureManagerDelegate {
     }
 
     func audioCaptureManagerDidWake(_ manager: AudioCaptureManager) {
-        NSLog("LeetViz: audio wake (silent → audible)")
         silenceFrames = 0
         if renderTimer == nil {
             startRenderTimer()

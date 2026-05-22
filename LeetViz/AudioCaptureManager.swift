@@ -75,16 +75,12 @@ final class AudioCaptureManager: NSObject {
     // MARK: - Setup
 
     private func setupTap() {
-        NSLog("LeetViz: enumerating audio processes…")
         let processes = enumerateAudioProcesses()
-        NSLog("LeetViz: found %d audio process objects to tap", processes.count)
         guard !processes.isEmpty else {
-            NSLog("LeetViz: no audio process objects available — bailing")
             delegate?.audioCaptureManager(self, didFailWith: simpleError("No audio processes available"))
             return
         }
 
-        NSLog("LeetViz: creating Core Audio process tap…")
         // Explicit list of processes to mix down. The "global tap excluding
         // none" initializer didn't deliver samples in practice — enumerating
         // and mixing is the pattern that actually works.
@@ -96,33 +92,27 @@ final class AudioCaptureManager: NSObject {
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let createStatus = AudioHardwareCreateProcessTap(tapDescription, &newTapID)
         guard createStatus == noErr else {
-            NSLog("LeetViz: AudioHardwareCreateProcessTap failed: %d", createStatus)
             reportError(status: createStatus, stage: "create-tap")
             return
         }
         tapID = newTapID
-        NSLog("LeetViz: tap created (id=%u)", tapID)
 
         guard let tapUID = readTapUID(tapID: tapID) else {
-            NSLog("LeetViz: couldn't read tap UID — bailing")
             teardown()
             delegate?.audioCaptureManager(self, didFailWith: simpleError("Could not read tap UID"))
             return
         }
 
-        // The aggregate device needs a real audio device to act as the clock
-        // source — without one, the tap is wired in but no samples are
-        // delivered (you see Create + Start succeed but the IOProc never
-        // fires). The default system output device is the right pick: it's
-        // where the audio the user is hearing is going, so the tap's mix
-        // naturally lines up with its clock.
+        // The aggregate device needs a real hardware audio device to act as
+        // the clock source — without one, the tap is wired in but no samples
+        // are delivered (Create + Start both succeed yet the IOProc never
+        // fires). Aggregate-of-aggregates (e.g. eqMac) breaks here, so we
+        // pick a real hardware output rather than trusting the default.
         guard let outputUID = hardwareOutputDeviceUID() else {
-            NSLog("LeetViz: couldn't find a hardware output device — bailing")
             teardown()
             delegate?.audioCaptureManager(self, didFailWith: simpleError("No hardware output device"))
             return
         }
-        NSLog("LeetViz: anchoring aggregate to hardware output UID=%@", outputUID)
 
         let aggregateUID = "app.leetviz.aggregate.\(UUID().uuidString)"
         let aggregateDescription: [String: Any] = [
@@ -149,13 +139,11 @@ final class AudioCaptureManager: NSObject {
             &newAggregateID
         )
         guard aggStatus == noErr else {
-            NSLog("LeetViz: AudioHardwareCreateAggregateDevice failed: %d", aggStatus)
             teardown()
             reportError(status: aggStatus, stage: "create-aggregate")
             return
         }
         aggregateDeviceID = newAggregateID
-        NSLog("LeetViz: aggregate device created (id=%u)", aggregateDeviceID)
 
         // Register IOProc and start. The IOProc fires on Core Audio's real-time
         // thread; we pass `self` through inClientData and reverse it inside.
@@ -168,48 +156,18 @@ final class AudioCaptureManager: NSObject {
             &newProcID
         )
         guard procStatus == noErr, let procID = newProcID else {
-            NSLog("LeetViz: AudioDeviceCreateIOProcID failed: %d", procStatus)
             teardown()
             reportError(status: procStatus, stage: "create-ioproc")
             return
         }
         ioProcID = procID
 
-        // Inspect the input stream format so we know what the IOProc is
-        // going to deliver. If the format isn't Float32 we won't decode it
-        // correctly; log it loudly so future-us isn't confused.
-        var inputFormat = AudioStreamBasicDescription()
-        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        var formatAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamFormat,
-            mScope: kAudioObjectPropertyScopeInput,
-            mElement: 0
-        )
-        let formatStatus = AudioObjectGetPropertyData(
-            aggregateDeviceID, &formatAddress, 0, nil, &formatSize, &inputFormat
-        )
-        if formatStatus == noErr {
-            let isFloat = (inputFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-            let isNonInterleaved = (inputFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-            NSLog("LeetViz: aggregate input format — sampleRate=%.0f channels=%u float=%@ nonInterleaved=%@ bytesPerFrame=%u",
-                  inputFormat.mSampleRate,
-                  inputFormat.mChannelsPerFrame,
-                  isFloat ? "yes" : "NO",
-                  isNonInterleaved ? "yes" : "no",
-                  inputFormat.mBytesPerFrame)
-        } else {
-            NSLog("LeetViz: couldn't read aggregate input stream format (status=%d)", formatStatus)
-        }
-
         let startStatus = AudioDeviceStart(aggregateDeviceID, procID)
         guard startStatus == noErr else {
-            NSLog("LeetViz: AudioDeviceStart failed: %d", startStatus)
             teardown()
             reportError(status: startStatus, stage: "start-device")
             return
         }
-
-        NSLog("LeetViz: Core Audio tap streaming — audio flowing")
     }
 
     private func teardown() {
@@ -240,19 +198,13 @@ final class AudioCaptureManager: NSObject {
         let s1 = AudioObjectGetPropertyDataSize(
             AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size
         )
-        guard s1 == noErr, size > 0 else {
-            NSLog("LeetViz: process list size query failed (status=%d size=%u)", s1, size)
-            return []
-        }
+        guard s1 == noErr, size > 0 else { return [] }
         let count = Int(size) / MemoryLayout<AudioObjectID>.size
         var processes = [AudioObjectID](repeating: 0, count: count)
         let s2 = AudioObjectGetPropertyData(
             AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &processes
         )
-        guard s2 == noErr else {
-            NSLog("LeetViz: process list query failed (status=%d)", s2)
-            return []
-        }
+        guard s2 == noErr else { return [] }
         return processes
     }
 
@@ -284,7 +236,6 @@ final class AudioCaptureManager: NSObject {
         // all qualify; eqMac, BlackHole, Loopback aggregates are skipped.
         for id in deviceIDs {
             if hasOutputStreams(id), !isAggregate(id), let uid = deviceUID(id) {
-                NSLog("LeetViz: picked hardware output UID=%@ id=%u", uid, id)
                 return uid
             }
         }
@@ -361,21 +312,11 @@ final class AudioCaptureManager: NSObject {
 
     // MARK: - IOProc
 
-    private var loggedFirstCallback = false
-    private var loggedFirstAudible = false
-
     fileprivate func handleAudio(bufferList: UnsafePointer<AudioBufferList>) {
         let mutableList = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: bufferList)
         )
         guard mutableList.count > 0 else { return }
-
-        if !loggedFirstCallback {
-            loggedFirstCallback = true
-            let firstBuffer = mutableList[0]
-            NSLog("LeetViz: first IOProc callback — buffers=%d, ch=%u, bytes=%u",
-                  mutableList.count, firstBuffer.mNumberChannels, firstBuffer.mDataByteSize)
-        }
 
         // Downmix to mono float. The tap delivers Float32; if the layout is
         // interleaved we have one buffer with N channels, otherwise one buffer
@@ -435,10 +376,6 @@ final class AudioCaptureManager: NSObject {
         ringLock.unlock()
 
         let audible = peak >= wakeThreshold
-        if audible && !loggedFirstAudible {
-            loggedFirstAudible = true
-            NSLog("LeetViz: first audible audio (peak=%.4f)", peak)
-        }
         if audible && !wasAudible {
             wasAudible = true
             DispatchQueue.main.async { [weak self] in
@@ -457,7 +394,6 @@ final class AudioCaptureManager: NSObject {
 
 /// C-style IOProc trampoline. Core Audio fires this on its real-time thread;
 /// we hop into the manager instance via the opaque clientData pointer.
-private var ioprocFireCount: Int = 0
 private let audioIOProcCallback: AudioDeviceIOProc = { (
     _ inDevice: AudioObjectID,
     _ inNow: UnsafePointer<AudioTimeStamp>,
@@ -467,24 +403,6 @@ private let audioIOProcCallback: AudioDeviceIOProc = { (
     _ inOutputTime: UnsafePointer<AudioTimeStamp>,
     _ inClientData: UnsafeMutableRawPointer?
 ) -> OSStatus in
-    // Log the first few invocations regardless of buffer state, so we can tell
-    // "IOProc never fires" apart from "IOProc fires with empty buffers" apart
-    // from "IOProc fires but buffers have a format we don't decode".
-    ioprocFireCount += 1
-    if ioprocFireCount <= 3 {
-        let bl = inInputData.pointee
-        let firstBufferBytes: UInt32
-        let firstBufferChannels: UInt32
-        if bl.mNumberBuffers > 0 {
-            firstBufferBytes = bl.mBuffers.mDataByteSize
-            firstBufferChannels = bl.mBuffers.mNumberChannels
-        } else {
-            firstBufferBytes = 0
-            firstBufferChannels = 0
-        }
-        NSLog("LeetViz: IOProc fire #%d — numBuffers=%u firstBytes=%u firstCh=%u",
-              ioprocFireCount, bl.mNumberBuffers, firstBufferBytes, firstBufferChannels)
-    }
     guard let clientData = inClientData else { return noErr }
     let manager = Unmanaged<AudioCaptureManager>.fromOpaque(clientData).takeUnretainedValue()
     manager.handleAudio(bufferList: inInputData)

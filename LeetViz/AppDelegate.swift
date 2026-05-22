@@ -10,7 +10,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// only wires up the delegate when a Main nib/storyboard exists. We don't
     /// ship one (LSUIElement app), so we attach the delegate ourselves.
     static func main() {
-        NSLog("LeetViz: main() — bootstrapping NSApplication")
         let app = NSApplication.shared
         let delegate = AppDelegate()
         keepAlive = delegate
@@ -19,7 +18,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSLog("LeetViz: applicationDidFinishLaunching")
         NSApp.setActivationPolicy(.accessory)
         menuBarController = MenuBarController()
         menuBarController.start()
