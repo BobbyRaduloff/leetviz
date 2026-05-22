@@ -1,4 +1,4 @@
-# LeetViz
+# LeetViz -- a status bar audio visualizer for macOS
 
 A tiny macOS menu bar app that visualizes whatever music is playing on your Mac. Captures system audio (not the mic) via ScreenCaptureKit, runs a real FFT, and draws bars / waveform / pulsing blocks straight inside the status item.
 

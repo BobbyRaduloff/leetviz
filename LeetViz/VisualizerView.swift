@@ -174,36 +174,28 @@ final class VisualizerView: NSView {
     }
 
     // MARK: - Pulsing blocks
-    // 5 blocks, one per frequency band group (sub-bass → treble). Each block
-    // pulses independently. When silent, all five sit at baseline so the menu
-    // bar item is visible.
+    // One block per frequency band, rendered as a vertically-centered pill that
+    // pulses with that band's energy. Visually distinct from the bottom-grown
+    // spectrum bars: same data, different feel.
+
+    private let blockCount = 16
 
     private func drawBlocks(ctx: CGContext, rect: CGRect) {
-        let blockCount = 5
-        // Distribute the 16 band slots across 5 blocks (low → high).
-        let slices: [(Int, Int)] = [(0, 3), (3, 6), (6, 10), (10, 13), (13, 16)]
-        let pad: CGFloat = 3
-        let totalPad = pad * CGFloat(blockCount - 1)
-        let bw = max(1, (rect.width - totalPad) / CGFloat(blockCount))
-        let baseHeight: CGFloat = 4
+        let values: [Float] = bands.isEmpty
+            ? [Float](repeating: 0, count: blockCount)
+            : bands
+        let n = values.count
+        let pad: CGFloat = 1.5
+        let totalPad = pad * CGFloat(n - 1)
+        let bw = max(1, (rect.width - totalPad) / CGFloat(n))
+        let baseHeight: CGFloat = 2
         ctx.setFillColor(accent.nsColor.cgColor)
-        for i in 0..<blockCount {
-            let (lo, hi) = slices[i]
-            var v: Float = 0
-            if !bands.isEmpty {
-                var sum: Float = 0
-                var n: Float = 0
-                for b in lo..<min(hi, bands.count) {
-                    sum += bands[b]
-                    n += 1
-                }
-                v = n > 0 ? sum / n : 0
-            }
+        for (i, v) in values.enumerated() {
             let cv = CGFloat(max(0, min(1, v)))
-            // Smooth shape: small minimum, grow with band intensity. A touch of
-            // gamma so quiet bands still register visibly.
-            let scaled = pow(cv, 0.75)
-            let h = max(baseHeight, scaled * (rect.height - 2))
+            // Near-linear height mapping. Earlier we used pow(cv, 0.7) to
+            // flatter quiet bands, but combined with soft-clip it made every
+            // band look the same height — kills the song-to-song variation.
+            let h = max(baseHeight, cv * (rect.height - 2))
             let y = (rect.height - h) / 2
             let x = CGFloat(i) * (bw + pad)
             ctx.fill(CGRect(x: x, y: y, width: bw, height: h))

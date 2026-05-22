@@ -18,13 +18,12 @@ final class FFTProcessor {
     private let sampleRate: Float
 
     /// Smoothing applied on attack (new > previous). 0 = instant, 1 = frozen.
-    /// Higher = less jitter, more lag. Lower = more transient detail (drum hits
-    /// punch through, vocals dance). 0.30 keeps it responsive without strobing.
-    var attackSmoothing: Float = 0.30
+    /// 0.15 = near-instant attack — drum hits punch through fully on the frame
+    /// they happen instead of being averaged with the surrounding silence.
+    var attackSmoothing: Float = 0.15
     /// Multiplied into the previous value each frame when input drops.
-    /// Closer to 1 = slower decay. 0.80 lets bars fall fast enough that
-    /// successive snare hits actually look distinct.
-    var decay: Float = 0.80
+    /// 0.75 = peak hangs briefly then falls back so the next peak stands out.
+    var decay: Float = 0.75
 
     private var fftSetup: FFTSetup
     private var window: [Float]
@@ -51,11 +50,12 @@ final class FFTProcessor {
     }
 
     private static func makeBandGains(count: Int) -> [Float] {
-        // Bass: 0.22  →  Treble: 2.20. The ramp uses pow(frac, 0.7) so the
-        // attenuation in the low end is more aggressive than a straight line,
-        // tames the kick drum dominance you get with un-weighted FFT magnitudes.
-        let bassGain: Float = 0.22
-        let trebleGain: Float = 2.20
+        // Bass: 0.35  →  Treble: 1.40. We pulled the treble end back from 2.20
+        // because combined with soft-clip it was pushing every mid/high band to
+        // saturation, which made every song look like the same fat blob.
+        // The pow(frac, 0.7) curve keeps the bass aggressively attenuated.
+        let bassGain: Float = 0.35
+        let trebleGain: Float = 1.40
         return (0..<count).map { i in
             let frac = Float(i) / Float(max(1, count - 1))
             let curved = powf(frac, 0.7)
@@ -123,13 +123,15 @@ final class FFTProcessor {
             let highHz = minHz * powf(maxHz / minHz, highFrac)
             let lowBin  = max(1, Int(lowHz / binWidth))
             let highBin = max(lowBin + 1, Int(highHz / binWidth))
-            var sum: Float = 0
-            var n: Float = 0
+            // Peak per band (not mean). Averaging buries transients — a snare
+            // hit produces a narrow spike across a few bins, and the mean of
+            // a band's worth of bins flattens that spike into nothing visible.
+            // Peak preserves the spike so drum hits and high notes actually punch.
+            var peak: Float = 0
             for b in lowBin..<min(highBin, mags.count) {
-                sum += mags[b]
-                n += 1
+                if mags[b] > peak { peak = mags[b] }
             }
-            newBands[i] = n > 0 ? sum / n : 0
+            newBands[i] = peak
         }
 
         // Apply per-band perceptual gain (bass attenuation / treble boost).
@@ -142,8 +144,12 @@ final class FFTProcessor {
         // the top instead of capping flat halfway up) while expanding the
         // mid-range so loud bars look meaningfully taller than quiet ones.
         // Lower `normDivisor` = more sensitive; lower `softClipK` = more "drama".
-        let normDivisor: Float = 3.2
-        let softClipK: Float = 1.8
+        // Tuned against peak-per-band aggregation: peak values run higher than
+        // the previous mean values, so we bump normDivisor up. softClipK is
+        // moderate — enough to let genuine transients reach the top, not so
+        // much that sustained tones all saturate.
+        let normDivisor: Float = 5.5
+        let softClipK: Float = 1.4
         for i in 0..<bandCount {
             let x = max(0, newBands[i] / normDivisor)
             newBands[i] = 1 - expf(-x * softClipK)
