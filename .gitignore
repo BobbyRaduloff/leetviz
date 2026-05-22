@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Xcode — user data
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+IDEWorkspaceChecks.plist
+IDEFindNavigatorScopes.plist
+
+# Xcode — build artifacts
+build/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager (not used here, but future-proof)
+.swiftpm/
+Package.resolved
+.build/
+
+# Misc
+*.log
